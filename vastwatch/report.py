@@ -72,6 +72,7 @@ agg AS (
     SUM(CASE WHEN COALESCE(verified, 0) = 1 THEN 1 ELSE 0 END) AS verified_offers,
     SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers
   FROM latest
+  {where_clause}
   GROUP BY 1,2
 ),
 occupancy AS (
@@ -155,6 +156,7 @@ agg AS (
     SUM(CASE WHEN COALESCE(verified, 0) = 1 THEN 1 ELSE 0 END) AS verified_offers,
     SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers
   FROM latest
+  {where_clause}
   GROUP BY 1,2
 ),
 occupancy AS (
@@ -320,16 +322,26 @@ def _sort_rows(
     )
 
 
-def _run_latest(conn, sort_spec: str | None) -> None:
+def _run_latest(
+    conn,
+    sort_spec: str | None,
+    where_sql: str | None = None,
+    title: str | None = None,
+) -> None:
     cur = conn.cursor()
     sql = LATEST_SNAPSHOT_QUERY
+    where_clause = f"WHERE {where_sql}\n" if where_sql else ""
+    query = sql.format(where_clause=where_clause)
     try:
-        rows = cur.execute(sql).fetchall()
+        rows = cur.execute(query).fetchall()
         rows = _sort_rows(rows, cur.description, sort_spec)
     except Exception:
-        rows = cur.execute(LATEST_SNAPSHOT_QUERY_SQLITE_FALLBACK).fetchall()
+        fallback_query = LATEST_SNAPSHOT_QUERY_SQLITE_FALLBACK.format(where_clause=where_clause)
+        rows = cur.execute(fallback_query).fetchall()
         rows = _sort_rows(rows, cur.description, sort_spec)
     _maybe_print_warning()
+    if title:
+        print(title)
     _print_tsv(cur, rows)
 
 
@@ -506,6 +518,11 @@ def main() -> None:
             "Defaults to '-api_rented_pct'."
         ),
     )
+    parser.add_argument(
+        "--split-verified",
+        action="store_true",
+        help="When set, print separate tables for verified and non-verified providers",
+    )
     args = parser.parse_args()
 
     db_path = os.environ.get("VW_DB", "vastwatch.db")
@@ -518,8 +535,26 @@ def main() -> None:
     except Exception:
         pass
 
+    def run_latest_tables():
+        if args.split_verified:
+            _run_latest(
+                conn,
+                args.sort,
+                where_sql="COALESCE(verified,0)=1",
+                title="Verified providers",
+            )
+            print()
+            _run_latest(
+                conn,
+                args.sort,
+                where_sql="COALESCE(verified,0)=0",
+                title="Unverified+deverified providers",
+            )
+        else:
+            _run_latest(conn, args.sort)
+
     if args.mode == "latest":
-        _run_latest(conn, args.sort)
+        run_latest_tables()
         return
     run_latest_after = False
     if args.mode in {"occupancy", "both"}:
@@ -534,10 +569,10 @@ def main() -> None:
         run_latest_after = args.mode == "both"
     if args.mode == "both":
         print()
-        _run_latest(conn, args.sort)
+        run_latest_tables()
     elif run_latest_after:
         print()
-        _run_latest(conn, args.sort)
+        run_latest_tables()
 
 
 if __name__ == "__main__":
