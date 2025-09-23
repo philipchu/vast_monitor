@@ -1,0 +1,10 @@
+services:
+  collector:
+    build: .
+    env_file: .env
+    environment:
+      - VW_DB=/data/vastwatch.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
