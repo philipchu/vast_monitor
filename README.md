@@ -11,6 +11,15 @@ Measure whether Vast.ai devices are actually being used, and turn that into util
 - It computes rolling utilization and price metrics by GPU, region, etc.
 - Output lives in a single SQLite (or DuckDB) file and is easy to query / dashboard.
 
+## What’s Implemented
+
+- `python -m vastwatch.collector` polls Vast bundles in three states (available, rented, unrentable), normalises the payload, and appends rows into `offers_raw` in SQLite or DuckDB. Schema migrations for `verified`, `deverified`, and `availability_state` are handled automatically at launch.
+- API calls include exponential backoff with jitter, respect `Retry-After`, and surface typed `VastAPIError` exceptions for the collector loop.
+- `.env` is loaded via `python-dotenv`; environment flags cover poll interval, timeout, inclusion of unverified offers, extra Vast filters, and database location.
+- `python -m vastwatch.report` renders Rich (or ASCII) tables for latest utilisation, pricing, and historical occupancy. It supports splitting verified vs unverified providers, filtering by GPU name/count, exporting to TSV/CSV, and occupancy roll-ups.
+- Saved SQL in `vastwatch/queries/` provides ready-made views (`latest_utilization.sql`, `device_occupancy.sql`) for notebooks or dashboards.
+- `VW_DB` can target `.db` / `.sqlite` (SQLite) or `.duckdb` / `.ddb` (DuckDB) files; the collector initialises the schema for either backend.
+
 ---
 
 ## Why
@@ -122,13 +131,6 @@ git clone <your-repo> vastwatch && cd vastwatch
 python -m venv .venv
 source .venv/bin/activate
 
-# Install deps
-cat > requirements.txt <<'REQ'
-requests
-duckdb>=1.0.0   # optional, if you prefer DuckDB alongside SQLite
-sqlite-utils    # optional helper
-python-dotenv
-REQ
 pip install -r requirements.txt
 
 # Seed env vars
@@ -146,8 +148,44 @@ VW_DB=vastwatch.db
 VW_POLL_INTERVAL_SEC=360
 VW_TIMEOUT_SEC=60
 VW_INCLUDE_UNVERIFIED=1
+VW_EXTRA_FILTERS_JSON=
 # Override only if Vast changes their API hostname/path
 VAST_BASE_URL=https://cloud.vast.ai/api/v0
+```
+
+## Running the Collector
+
+```bash
+python -m vastwatch.collector
+```
+
+- Defaults poll every 360 s (6 × Vast’s 60 s minimum). Override with `VW_POLL_INTERVAL_SEC`.
+- `VW_DB` decides the backend: point at `*.db`/`*.sqlite` for SQLite or `*.duckdb`/`*.ddb` for DuckDB.
+- `VW_EXTRA_FILTERS_JSON` can merge additional Vast query fragments, e.g. `{"gpu_name": {"like": "%4090%"}}`.
+- Logs report offer counts per state plus inserted row totals. Errors back off automatically and continue.
+
+## Reporting & Analysis
+
+Rich summary tables and historical views:
+
+```bash
+python -m vastwatch.report --help
+python -m vastwatch.report latest
+python -m vastwatch.report latest --split-verified
+python -m vastwatch.report occupancy --since 2025-10-01T00:00:00Z --until now
+python -m vastwatch.report both --gpu-names "H100,RTX 4090" --save latest.tsv
+```
+
+- `latest` → snapshot utilisation, pricing, verification mix (with optional filters on GPU name/count).
+- `occupancy` → time-weighted utilisation per offer across a window (parameters for minimum samples/minutes).
+- `both` → occupancy view followed by the latest snapshot.
+- Use `--save <path>` to export to TSV/CSV for spreadsheets.
+
+Saved SQL helpers:
+
+```bash
+sqlite3 vastwatch.db '.read vastwatch/queries/latest_utilization.sql'
+duckdb vastwatch.duckdb -c ".read vastwatch/queries/device_occupancy.sql"
 ```
 
 ---
@@ -211,7 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_gpu ON offers_raw(gpu_name, geolocation, type);
 - Default mode runs the occupancy report (and also prints the latest snapshot).
 - `--mode latest` and `--mode both` let you focus the output; occupancy respects the same window and uses the poll cadence (default = 360s).
 
-Default latest snapshot groups the newest poll by `gpu_name` + GPU-count bucket, counts how many offers are `rentable=true` (available) versus `rentable=false` (assumed utilized), and reports utilization + average prices for each group. The assumed utilization ignores Vast’s flaky `rented` flag; raw `rented` counts are still shown for reference. A warning reflecting this assumption is printed with every report.
+Default latest snapshot groups the newest poll by `gpu_name` + GPU-count bucket, counts how many offers are `rentable=true` (available) versus `rentable=false` (assumed utilized), and reports utilization + average prices for each group. The table now includes `ex_price_per_gpu`, an estimated expected $/hr per GPU (`price_util_avg * (util_pct_assumed / 100) / num_gpus`). The assumed utilization ignores Vast’s flaky `rented` flag; raw `rented` counts are still shown for reference. A warning reflecting this assumption is printed with every report.
 
 - Print as a TSV to stdout.
 
@@ -231,6 +269,15 @@ python -m vastwatch.report --since $(date -u -d '7 days ago' +%FT%TZ)
 
 # Snapshot only
 python -m vastwatch.report --mode latest
+
+# Snapshot filtered to specific GPUs and machine sizes
+python -m vastwatch.report --mode latest \
+  --gpu-name "4090,5090,3090,3080,3070,3060,A100,H100,L40S" \
+  --gpu-count "1,2,4,8"
+
+# Split verified vs. unverified providers with filters applied
+python -m vastwatch.report --mode latest --split-verified \
+  --gpu-name "4090,5090" --gpu-count "1,2,4"
 ```
 
 ---

@@ -70,7 +70,8 @@ agg AS (
     ROUND(AVG(CASE WHEN rentable = 1 THEN dph_total_usd END), 3) AS avg_price_available,
     ROUND(AVG(CASE WHEN rentable = 0 THEN dph_total_usd END), 3) AS avg_price_utilized,
     SUM(CASE WHEN COALESCE(verified, 0) = 1 THEN 1 ELSE 0 END) AS verified_offers,
-    SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers
+    SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers,
+    AVG(num_gpus) AS avg_gpu_count
   FROM latest
   {where_clause}
   GROUP BY 1,2
@@ -108,6 +109,13 @@ SELECT
   agg.api_rented_pct AS util_pct_api,
   agg.avg_price_available AS price_avail_avg,
   agg.avg_price_utilized AS price_util_avg,
+  ROUND(
+    CASE
+      WHEN agg.avg_gpu_count IS NULL OR agg.avg_gpu_count = 0 OR agg.avg_price_utilized IS NULL THEN NULL
+      ELSE agg.avg_price_utilized * (agg.assumed_utilization_pct / 100.0) / agg.avg_gpu_count
+    END,
+    4
+  ) AS "ex$_per_gpu",
   agg.verified_offers,
   agg.deverified_offers,
   COALESCE(occupancy.assumed_rented_time_pct, 0.0) AS time_pct_assumed,
@@ -154,7 +162,8 @@ agg AS (
     ROUND(AVG(CASE WHEN rentable = 1 THEN dph_total_usd END), 3) AS avg_price_available,
     ROUND(AVG(CASE WHEN rentable = 0 THEN dph_total_usd END), 3) AS avg_price_utilized,
     SUM(CASE WHEN COALESCE(verified, 0) = 1 THEN 1 ELSE 0 END) AS verified_offers,
-    SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers
+    SUM(CASE WHEN COALESCE(deverified, 0) = 1 THEN 1 ELSE 0 END) AS deverified_offers,
+    AVG(num_gpus) AS avg_gpu_count
   FROM latest
   {where_clause}
   GROUP BY 1,2
@@ -192,6 +201,13 @@ SELECT
   agg.api_rented_pct AS util_pct_api,
   agg.avg_price_available AS price_avail_avg,
   agg.avg_price_utilized AS price_util_avg,
+  ROUND(
+    CASE
+      WHEN agg.avg_gpu_count IS NULL OR agg.avg_gpu_count = 0 OR agg.avg_price_utilized IS NULL THEN NULL
+      ELSE agg.avg_price_utilized * (agg.assumed_utilization_pct / 100.0) / agg.avg_gpu_count
+    END,
+    4
+  ) AS "ex$_per_gpu",
   agg.verified_offers,
   agg.deverified_offers,
   COALESCE(occupancy.assumed_rented_time_pct, 0.0) AS time_pct_assumed,
@@ -241,6 +257,42 @@ def _print_rows(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
 def _print_tsv(cursor, rows: Sequence[Sequence[Any]]) -> None:
     colnames = [d[0] for d in cursor.description]
     _print_rows(colnames, rows)
+
+
+def _normalize_filter_values(values: Sequence[str] | None) -> list[str]:
+    if not values:
+        return []
+    normalized: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        parts = [part.strip() for part in value.split(',')]
+        normalized.extend(part for part in parts if part)
+    return normalized
+
+
+def _build_gpu_filters(
+    gpu_names: Sequence[str] | None,
+    gpu_counts: Sequence[str] | None,
+) -> tuple[str, list[str], list[int]]:
+    clauses: list[str] = []
+    name_tokens = [token.lower() for token in _normalize_filter_values(gpu_names)]
+    if name_tokens:
+        name_clauses = [
+            "LOWER(gpu_name) LIKE '%' || ? || '%'"
+            for _ in name_tokens
+        ]
+        clauses.append(f"({' OR '.join(name_clauses)})")
+    count_tokens = []
+    for token in _normalize_filter_values(gpu_counts):
+        try:
+            count_tokens.append(int(token))
+        except ValueError:
+            continue
+    if count_tokens:
+        placeholders = ",".join("?" for _ in count_tokens)
+        clauses.append(f"num_gpus IN ({placeholders})")
+    return " AND ".join(clauses), name_tokens, count_tokens
 
 
 def _ensure_columns(conn, backend: str) -> None:
@@ -327,17 +379,28 @@ def _run_latest(
     sort_spec: str | None,
     where_sql: str | None = None,
     title: str | None = None,
+    gpu_names: Sequence[str] | None = None,
+    gpu_counts: Sequence[str] | None = None,
 ) -> None:
     cur = conn.cursor()
     sql = LATEST_SNAPSHOT_QUERY
-    where_clause = f"WHERE {where_sql}\n" if where_sql else ""
+    extra_filter_sql, name_tokens, count_tokens = _build_gpu_filters(gpu_names, gpu_counts)
+    filters: list[str] = []
+    params: list[Any] = []
+    if where_sql:
+        filters.append(where_sql)
+    if extra_filter_sql:
+        filters.append(extra_filter_sql)
+        params.extend(name_tokens)
+        params.extend(count_tokens)
+    where_clause = f"WHERE {' AND '.join(filters)}\n" if filters else ""
     query = sql.format(where_clause=where_clause)
     try:
-        rows = cur.execute(query).fetchall()
+        rows = cur.execute(query, params).fetchall()
         rows = _sort_rows(rows, cur.description, sort_spec)
     except Exception:
         fallback_query = LATEST_SNAPSHOT_QUERY_SQLITE_FALLBACK.format(where_clause=where_clause)
-        rows = cur.execute(fallback_query).fetchall()
+        rows = cur.execute(fallback_query, params).fetchall()
         rows = _sort_rows(rows, cur.description, sort_spec)
     _maybe_print_warning()
     if title:
@@ -523,6 +586,18 @@ def main() -> None:
         action="store_true",
         help="When set, print separate tables for verified and non-verified providers",
     )
+    parser.add_argument(
+        "--gpu-name",
+        dest="gpu_names",
+        action="append",
+        help="Include only offers whose GPU name contains any of these substrings (repeat or comma separated)",
+    )
+    parser.add_argument(
+        "--gpu-count",
+        dest="gpu_counts",
+        action="append",
+        help="Include only offers with these GPU counts per machine (repeat or comma separated)",
+    )
     args = parser.parse_args()
 
     db_path = os.environ.get("VW_DB", "vastwatch.db")
@@ -535,6 +610,9 @@ def main() -> None:
     except Exception:
         pass
 
+    gpu_name_filters = _normalize_filter_values(getattr(args, "gpu_names", None))
+    gpu_count_filters = _normalize_filter_values(getattr(args, "gpu_counts", None))
+
     def run_latest_tables():
         if args.split_verified:
             _run_latest(
@@ -542,6 +620,8 @@ def main() -> None:
                 args.sort,
                 where_sql="COALESCE(verified,0)=1",
                 title="Verified providers",
+                gpu_names=gpu_name_filters or None,
+                gpu_counts=gpu_count_filters or None,
             )
             print()
             _run_latest(
@@ -549,9 +629,16 @@ def main() -> None:
                 args.sort,
                 where_sql="COALESCE(verified,0)=0",
                 title="Unverified+deverified providers",
+                gpu_names=gpu_name_filters or None,
+                gpu_counts=gpu_count_filters or None,
             )
         else:
-            _run_latest(conn, args.sort)
+            _run_latest(
+                conn,
+                args.sort,
+                gpu_names=gpu_name_filters or None,
+                gpu_counts=gpu_count_filters or None,
+            )
 
     if args.mode == "latest":
         run_latest_tables()
