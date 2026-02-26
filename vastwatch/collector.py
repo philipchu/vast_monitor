@@ -157,9 +157,11 @@ def main() -> None:
                 extra_filters=extra_q,
                 timeout_sec=timeout_sec,
             )
+            # Query rented offers: rented=True without rentable filter
+            # (rentable=False causes API to return all non-rentable offers)
             rented = search_offers(
                 rented=True,
-                rentable=False,
+                rentable=None,  # Don't filter by rentable for rented query
                 extra_filters=extra_q,
                 timeout_sec=timeout_sec,
             )

@@ -252,8 +252,15 @@ def normalize(offer: Dict[str, Any], ts: str, source_state: str | None = None) -
     geolocation = _normalize_geo(offer)
     type_str = _normalize_type(offer)
     rentable = _to_bool_int(offer.get("rentable"))
-    rented = _to_bool_int(offer.get("rented"))
     src = (source_state or "").strip().lower() or None
+    # Derive rented from source_state, not from offer field (API doesn't reliably include it)
+    if src == "rented":
+        rented = 1
+    elif src in {"available", "unavailable"}:
+        rented = 0
+    else:
+        # Fallback to offer field if no source_state provided
+        rented = _to_bool_int(offer.get("rented"))
     verified_val = offer.get("verified")
     if verified_val is None:
         verified_val = offer.get("is_verified")
